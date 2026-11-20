@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VaultDB App</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#F5F5F7] text-[#1D1D1F] min-h-screen flex items-center justify-center p-4 font-sans antialiased">
+  <div class="w-full max-w-lg bg-white border border-[#E5E5EA] rounded-2xl p-6 sm:p-8 shadow-xs space-y-6">
+    <div id="lock-screen" class="space-y-4">
+      <div class="border-b border-[#E5E5EA] pb-3">
+        <h1 class="text-lg font-semibold">גישה מאובטחת למאגר</h1>
+        <p class="text-xs text-[#86868B] mt-0.5">הזן את סיסמת הפרונטאנד כדי לפענח את כתובת ה-API ולהתחבר ל-data.json.</p>
+      </div>
+      <form id="unlock-form" class="space-y-3">
+        <input type="password" id="unlock-password" required placeholder="סיסמת גישה..." dir="ltr"
+               class="w-full bg-[#F5F5F7] border border-[#E5E5EA] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:bg-white focus:border-[#0071E3]">
+        <button type="submit" class="w-full py-2.5 rounded-full bg-[#0071E3] hover:bg-[#0077ED] text-white text-sm font-medium transition-colors">
+          פתח גישה למאגר
+        </button>
+      </form>
+      <p id="unlock-error" class="hidden text-xs text-red-600"></p>
+    </div>
+
+    <div id="app-screen" class="hidden space-y-5">
+      <div class="flex items-center justify-between border-b border-[#E5E5EA] pb-3">
+        <div>
+          <h2 class="text-lg font-semibold">VaultDB App</h2>
+          <p class="text-xs text-[#86868B]">מחובר ל-data.json דרך Cloudflare Worker</p>
+        </div>
+        <button type="button" id="lock-btn" class="px-3.5 py-1.5 rounded-full bg-[#F5F5F7] hover:bg-gray-200 text-xs font-medium">
+          נעל
+        </button>
+      </div>
+
+      <form id="entry-form" class="flex gap-2">
+        <input type="text" id="entry-input" required placeholder="הזן טקסט לשמירה ב-data.json..."
+               class="flex-1 bg-[#F5F5F7] border border-[#E5E5EA] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:bg-white focus:border-[#0071E3]">
+        <button type="submit" id="save-btn" class="px-5 py-2.5 rounded-full bg-[#0071E3] hover:bg-[#0077ED] text-white text-sm font-medium shrink-0">
+          שמור
+        </button>
+      </form>
+
+      <div id="status-msg" class="text-xs text-[#86868B]"></div>
+      <ul id="items-list" class="space-y-2 max-h-64 overflow-y-auto"></ul>
+    </div>
+  </div>
+
+  <script>
+    const SALTED_VAULT = {"salt":"PLACEHOLDER","iv":"PLACEHOLDER","cipher":"PLACEHOLDER"};
+    let currentItems = [];
+
+    const VaultDB = {
+      endpoint: null,
+      queue: Promise.resolve(),
+      timer: null,
+      latestItems: null,
+      pendingResolvers: [],
+      async unlock(password) {
+        const b64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+        const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+        const aesKey = await crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: b64(SALTED_VAULT.salt), iterations: 100000, hash: 'SHA-256' },
+          keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+        );
+        const decryptedBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(SALTED_VAULT.iv) }, aesKey, b64(SALTED_VAULT.cipher));
+        this.endpoint = new TextDecoder().decode(decryptedBuffer);
+        return this.read();
+      },
+      async read() {
+        const res = await fetch(this.endpoint);
+        const data = await res.json();
+        return Array.isArray(data) ? data : [];
+      },
+      save(items, delay = 1500) {
+        this.latestItems = items;
+        return new Promise((resolve, reject) => {
+          this.pendingResolvers.push({ resolve, reject });
+          clearTimeout(this.timer);
+          this.timer = setTimeout(() => {
+            const snapshot = this.latestItems;
+            const batch = this.pendingResolvers.splice(0);
+            this.queue = this.queue
+              .then(() =>
+                fetch(this.endpoint, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(snapshot, null, 2)
+                })
+              )
+              .then((res) => {
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                batch.forEach((p) => p.resolve(res));
+              })
+              .catch((err) => {
+                batch.forEach((p) => p.reject(err));
+              });
+          }, delay);
+        });
+      },
+      lock() {
+        clearTimeout(this.timer);
+        this.timer = null;
+        this.latestItems = null;
+        this.endpoint = null;
+      }
+    };
+
+    function renderItems() {
+      const list = document.getElementById('items-list');
+      list.innerHTML = '';
+      currentItems.forEach((item) => {
+        const li = document.createElement('li');
+        li.className = 'p-3 rounded-xl bg-[#F5F5F7] border border-[#E5E5EA] text-xs flex justify-between items-center';
+        li.textContent = typeof item === 'object' ? (item.text || JSON.stringify(item)) : String(item);
+        list.appendChild(li);
+      });
+    }
+
+    document.getElementById('unlock-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('unlock-error');
+      errEl.classList.add('hidden');
+      try {
+        currentItems = await VaultDB.unlock(document.getElementById('unlock-password').value);
+        document.getElementById('unlock-password').value = '';
+        document.getElementById('lock-screen').classList.add('hidden');
+        document.getElementById('app-screen').classList.remove('hidden');
+        renderItems();
+        document.getElementById('status-msg').textContent = 'מעודכן (' + currentItems.length + ' רשומות)';
+      } catch {
+        errEl.textContent = 'סיסמה שגויה. נסה שנית.';
+        errEl.classList.remove('hidden');
+      }
+    });
+
+    document.getElementById('lock-btn').addEventListener('click', () => {
+      VaultDB.lock();
+      currentItems = [];
+      document.getElementById('app-screen').classList.add('hidden');
+      document.getElementById('lock-screen').classList.remove('hidden');
+    });
+
+    document.getElementById('entry-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('entry-input');
+      const status = document.getElementById('status-msg');
+      const text = input.value.trim();
+      if (!text || !VaultDB.endpoint) return;
+
+      // Optimistic UI: update screen immediately without locking the input
+      currentItems = [...currentItems, { id: Date.now(), text, createdAt: new Date().toISOString() }];
+      input.value = '';
+      renderItems();
+      status.textContent = 'ממתין לאיחוד שינויים (1.5 שניות)...';
+
+      try {
+        await VaultDB.save(currentItems);
+        status.textContent = 'נשמר בהצלחה ב-data.json ✓';
+      } catch (err) {
+        status.textContent = 'שגיאה בשמירה: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
